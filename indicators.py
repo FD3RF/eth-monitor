@@ -8,23 +8,22 @@ import requests
 from datetime import datetime, timedelta
 from typing import Dict, Tuple, Optional, List
 import time
+import traceback
+
 
 class MarketData:
     """真实市场数据管理器"""
     
     _instance = None
     _last_update = 0
-    _cache_duration = 10  # 缓存10秒
+    _cache_duration = 10
     _api_timeout = 10
     
-    # Binance API (免费公开接口)
-    # 备用API: Binance (主要) + CoinGecko (次要)
-COINGECKO_API = "https://api.coingecko.com/api/v3"
-
-BINANCE_PRICE_API = "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"
-BINANCE_KLINES_API = "https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=1h&limit=100"
-COINGECKO_API = "https://api.coingecko.com/api/v3/coins/ethereum/market_chart?vs_currency=usd&days=30"
-COINGECKO_OHlc_api = "https://api.coingecko.com/api/v3/coins/ethereum/ohlc?vs_currency=usd&days=30"
+    # API URLs
+    BINANCE_API = "https://api.binance.com/api/v3"
+    BINANCE_PRICE_API = "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"
+    BINANCE_KLINES_API = "https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=1h&limit=100"
+    COINGECKO_API = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
     
     def __new__(cls):
         if cls._instance is None:
@@ -45,59 +44,59 @@ COINGECKO_OHlc_api = "https://api.coingecko.com/api/v3/coins/ethereum/ohlc?vs_cu
         self._resistance = 3600.0
         self._klines = []
         self._last_api_call = 0
-        self._api_call_interval = 1  # API调用间隔(秒)
+        self._api_call_interval = 1
         
-        # 首次获取真实数据
+        # 尝试获取真实数据
         self._fetch_real_data()
     
     def _fetch_real_data(self):
-        """从Binance获取真实市场数据"""
+        """从多个数据源获取真实市场数据"""
+        data_fetched = False
+        
+        # 检查API调用频率限制
+        now = time.time()
+        if now - self._last_api_call < self._api_call_interval:
+            return
+        self._last_api_call = now
+        
+        # 尝试 Binance
         try:
-            # 检查API调用频率限制
-            now = time.time()
-            if now - self._last_api_call < self._api_call_interval:
-                return
-            self._last_api_call = now
-            
-            # 1. 获取当前价格
-            ticker_url = f"{self.BINANCE_API}/ticker/24hr?symbol=ETHUSDT"
-            response = requests.get(ticker_url, timeout=self._api_timeout)
+            url = self.BINANCE_PRICE_API
+            response = requests.get(url, timeout=self._api_timeout, verify=True)
             
             if response.status_code == 200:
                 data = response.json()
-                self._base_price = float(data.get('lastPrice', 3500))
-                self._volume_ratio = float(data.get('volume', 1)) / 100000  # 归一化成交量
-                price_change_pct = float(data.get('priceChangePercent', 0))
-                high_price = float(data.get('highPrice', self._base_price * 1.02))
-                low_price = float(data.get('lowPrice', self._base_price * 0.98))
+                self._base_price = float(data.get('price', 3500))
+                data_fetched = True
+        except Exception:
+            pass
+        
+        # 尝试 CoinGecko
+        if not data_fetched:
+            try:
+                url = self.COINGECKO_API
+                response = requests.get(url, timeout=self._api_timeout, verify=True)
                 
-                # 计算波动率
-                self._volatility = (high_price - low_price) / self._base_price if self._base_price > 0 else 0.02
+                if response.status_code == 200:
+                    data = response.json()
+                    self._base_price = float(data.get('ethereum', {}).get('usd', 3500))
+                    data_fetched = True
+            except Exception:
+                pass
+        
+        # 尝试获取K线数据计算指标
+        if data_fetched:
+            try:
+                url = self.BINANCE_KLINES_API
+                response = requests.get(url, timeout=self._api_timeout, verify=True)
                 
-                # 计算趋势
-                if price_change_pct > 1:
-                    self._trend = 1
-                elif price_change_pct < -1:
-                    self._trend = -1
-                else:
-                    self._trend = 0
-                
-                # 计算支撑压力位
-                self._support = low_price
-                self._resistance = high_price
-            
-            # 2. 获取K线数据计算技术指标
-            klines_url = f"{self.BINANCE_API}/klines?symbol=ETHUSDT&interval=1h&limit=100"
-            response = requests.get(klines_url, timeout=self._api_timeout)
-            
-            if response.status_code == 200:
-                self._klines = response.json()
-                self._calculate_indicators()
-            
-            self._last_update = time.time()
-            
-        except Exception as e:
-            print(f"获取真实数据失败，使用缓存数据: {e}")
+                if response.status_code == 200:
+                    self._klines = response.json()
+                    self._calculate_indicators()
+            except Exception:
+                pass
+        
+        self._last_update = time.time()
     
     def _calculate_indicators(self):
         """基于真实K线计算技术指标"""
@@ -105,11 +104,10 @@ COINGECKO_OHlc_api = "https://api.coingecko.com/api/v3/coins/ethereum/ohlc?vs_cu
             return
         
         try:
-            # 提取收盘价
             closes = [float(k[4]) for k in self._klines]
             volumes = [float(k[5]) for k in self._klines]
             
-            # 计算RSI (14周期)
+            # 计算RSI
             self._rsi = self._calculate_rsi(closes, 14)
             
             # 计算MACD信号
@@ -118,10 +116,36 @@ COINGECKO_OHlc_api = "https://api.coingecko.com/api/v3/coins/ethereum/ohlc?vs_cu
             # 计算资金流向
             self._money_flow = self._calculate_money_flow(closes, volumes)
             
-        except Exception as e:
-            print(f"计算指标失败: {e}")
+            # 计算支撑压力位
+            if len(closes) >= 20:
+                recent_closes = closes[-20:]
+                self._support = min(recent_closes) * 0.97
+                self._resistance = max(recent_closes) * 1.03
+            
+            # 计算波动率
+            high = max(closes[-24:])
+            low = min(closes[-24:])
+            self._volatility = (high - low) / self._base_price if self._base_price > 0 else 0.02
+            
+            # 计算趋势
+            if len(closes) >= 10:
+                change = (closes[-1] - closes[-10]) / closes[-10] * 100 if closes[-10] > 0 else 0
+                if change > 1:
+                    self._trend = 1
+                elif change < -1:
+                    self._trend = -1
+                else:
+                    self._trend = 0
+            
+            # 成交量比
+            if len(volumes) >= 2:
+                avg_vol = sum(volumes[-10:]) / 10
+                self._volume_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1.0
+            
+        except Exception:
+            pass
     
-    def _calculate_rsi(self, prices: List[float], period: int = 14) -> float:
+    def _calculate_rsi(self, prices, period=14):
         """计算RSI"""
         if len(prices) < period + 1:
             return 50.0
@@ -138,25 +162,21 @@ COINGECKO_OHlc_api = "https://api.coingecko.com/api/v3/coins/ethereum/ohlc?vs_cu
         
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
-        
         return round(rsi, 2)
     
-    def _calculate_macd_signal(self, prices: List[float]) -> float:
+    def _calculate_macd_signal(self, prices):
         """计算MACD信号"""
         if len(prices) < 26:
             return 0.0
         
-        # EMA计算
         ema12 = self._calculate_ema(prices, 12)
         ema26 = self._calculate_ema(prices, 26)
         
         macd = ema12 - ema26
-        
-        # 归一化到 -1 到 1
         signal = macd / prices[-1] * 100 if prices[-1] > 0 else 0
         return round(signal, 4)
     
-    def _calculate_ema(self, prices: List[float], period: int) -> float:
+    def _calculate_ema(self, prices, period):
         """计算EMA"""
         if len(prices) < period:
             return prices[-1] if prices else 0
@@ -169,12 +189,11 @@ COINGECKO_OHlc_api = "https://api.coingecko.com/api/v3/coins/ethereum/ohlc?vs_cu
         
         return ema
     
-    def _calculate_money_flow(self, prices: List[float], volumes: List[float]) -> float:
-        """计算资金流向 (MFI概念)"""
+    def _calculate_money_flow(self, prices, volumes):
+        """计算资金流向"""
         if len(prices) < 2 or len(volumes) < 2:
             return 0.0
         
-        # 简化版资金流向：价格上涨时成交量正相关
         price_changes = np.diff(prices[-20:]) if len(prices) >= 20 else np.diff(prices)
         volume_changes = volumes[-len(price_changes):]
         
@@ -192,54 +211,53 @@ COINGECKO_OHlc_api = "https://api.coingecko.com/api/v3/coins/ethereum/ohlc?vs_cu
         if total_flow == 0:
             return 0.0
         
-        # 归一化到 -1 到 1
         mfi = (positive_flow - negative_flow) / total_flow
         return round(mfi, 4)
     
-    def refresh(self, force: bool = False):
+    def refresh(self, force=False):
         """刷新数据"""
         now = time.time()
         if force or (now - self._last_update) > self._cache_duration:
             self._fetch_real_data()
     
     @property
-    def current_price(self) -> float:
+    def current_price(self):
         return round(self._base_price, 2)
     
     @property
-    def trend(self) -> int:
+    def trend(self):
         return self._trend
     
     @property
-    def support(self) -> float:
+    def support(self):
         return round(self._support, 2)
     
     @property
-    def resistance(self) -> float:
+    def resistance(self):
         return round(self._resistance, 2)
     
     @property
-    def volume_ratio(self) -> float:
+    def volume_ratio(self):
         return round(self._volume_ratio, 2)
     
     @property
-    def volatility(self) -> float:
+    def volatility(self):
         return round(self._volatility, 4)
     
     @property
-    def money_flow_raw(self) -> float:
+    def money_flow_raw(self):
         return self._money_flow
     
     @property
-    def rsi(self) -> float:
+    def rsi(self):
         return self._rsi
     
     @property
-    def macd_signal(self) -> float:
+    def macd_signal(self):
         return self._macd_signal
     
     @property
-    def klines(self) -> List:
+    def klines(self):
         return self._klines
 
 
@@ -247,39 +265,46 @@ COINGECKO_OHlc_api = "https://api.coingecko.com/api/v3/coins/ethereum/ohlc?vs_cu
 market_data = MarketData()
 
 
-def get_current_price() -> float:
+def get_current_price():
     """获取当前ETH真实价格"""
     market_data.refresh()
     return market_data.current_price
 
 
-def get_support_resistance() -> Tuple[float, float]:
+def get_support_resistance():
     """获取真实支撑位和压力位"""
     market_data.refresh()
     return market_data.support, market_data.resistance
 
 
-def calculate_volume_price() -> float:
-    """
-    量价口诀评分 (-100 到 100)
-    基于真实成交量和价格趋势
-    """
+def get_market_summary():
+    """获取市场数据摘要"""
+    market_data.refresh()
+    return {
+        'price': market_data.current_price,
+        'support': market_data.support,
+        'resistance': market_data.resistance,
+        'trend': market_data.trend,
+        'rsi': market_data.rsi,
+        'volume_ratio': market_data.volume_ratio,
+        'volatility': market_data.volatility
+    }
+
+
+def calculate_volume_price():
+    """量价口诀评分"""
     market_data.refresh()
     
-    score = 0.0
+    score = market_data.trend * 40
     
-    # 1. 价格趋势贡献 (40%)
-    trend_score = market_data.trend * 40
-    score += trend_score
-    
-    # 2. 成交量确认 (30%)
+    # 成交量确认
     volume_factor = (market_data.volume_ratio - 1) * 30
     if market_data.trend > 0:
         score += volume_factor
     elif market_data.trend < 0:
         score -= volume_factor
     
-    # 3. RSI 辅助 (30%)
+    # RSI辅助
     if market_data.rsi > 70:
         score -= 15
     elif market_data.rsi < 30:
@@ -290,23 +315,16 @@ def calculate_volume_price() -> float:
     return round(max(-100, min(100, score)), 2)
 
 
-def calculate_multi_resonance() -> float:
-    """
-    多空共振评分 (-100 到 100)
-    基于真实技术指标
-    """
+def calculate_multi_resonance():
+    """多空共振评分"""
     market_data.refresh()
     
     score = 0.0
     signals = []
     
-    # 趋势信号
     signals.append(market_data.trend * 25)
-    
-    # MACD 信号
     signals.append(market_data.macd_signal * 20)
     
-    # RSI 信号
     if market_data.rsi > 70:
         signals.append(-15)
     elif market_data.rsi < 30:
@@ -314,13 +332,11 @@ def calculate_multi_resonance() -> float:
     else:
         signals.append((market_data.rsi - 50) * 0.4)
     
-    # 成交量确认
     if market_data.volume_ratio > 1.5:
         signals.append(market_data.trend * 15)
     else:
         signals.append(market_data.trend * 5)
     
-    # 计算共振强度
     positive_signals = sum(1 for s in signals if s > 5)
     negative_signals = sum(1 for s in signals if s < -5)
     
@@ -334,11 +350,8 @@ def calculate_multi_resonance() -> float:
     return round(max(-100, min(100, score)), 2)
 
 
-def calculate_market_structure() -> float:
-    """
-    市场结构评分 (-100 到 100)
-    基于真实支撑压力位
-    """
+def calculate_market_structure():
+    """市场结构评分"""
     market_data.refresh()
     
     score = 0.0
@@ -346,7 +359,6 @@ def calculate_market_structure() -> float:
     support = market_data.support
     resistance = market_data.resistance
     
-    # 位置分析
     range_size = resistance - support
     price_position = (price - support) / range_size if range_size > 0 else 0.5
     
@@ -361,30 +373,20 @@ def calculate_market_structure() -> float:
     else:
         score += (price_position - 0.5) * 20
     
-    # 趋势结构
     score += market_data.trend * 30
     
-    # 波动率考量
     if market_data.volatility > 0.03:
         score *= 0.7
     
     return round(max(-100, min(100, score)), 2)
 
 
-def calculate_lstm_prediction() -> float:
-    """
-    LSTM预测评分 (-100 到 100)
-    基于真实趋势和RSI
-    """
+def calculate_lstm_prediction():
+    """LSTM预测评分"""
     market_data.refresh()
     
-    score = 0.0
+    score = market_data.trend * 60 * 0.6
     
-    # 趋势预测
-    if market_data.trend != 0:
-        score = market_data.trend * 60 * 0.6
-    
-    # RSI 反转预测
     if market_data.rsi > 75:
         score -= 20 * 0.4
     elif market_data.rsi < 25:
@@ -393,17 +395,17 @@ def calculate_lstm_prediction() -> float:
     return round(max(-100, min(100, score)), 2)
 
 
-def calculate_money_flow() -> float:
-    """
-    资金流向评分 (-100 到 100)
-    基于真实资金流向指标
-    """
+def calculate_money_flow():
+    """资金流向评分"""
     market_data.refresh()
     
-    score = 0.0
-    base_flow = market_data.money_flow_raw * 50
-    volume_weighted = base_flow * (0.5 + market_data.volume_ratio * 0.5)
+    base_flow = market_data.money_flow_raw
+    score = base_flow * 50
     
+    # 成交量加权
+    volume_weighted = score * (0.5 + market_data.volume_ratio * 0.5)
+    
+    # 趋势确认
     if market_data.trend > 0 and base_flow > 0:
         score = volume_weighted * 1.3
     elif market_data.trend < 0 and base_flow < 0:
@@ -416,25 +418,24 @@ def calculate_money_flow() -> float:
     return round(max(-100, min(100, score)), 2)
 
 
-def get_historical_prices(days: int = 30) -> Tuple[list, list]:
+def get_historical_prices(days=30):
     """获取真实历史K线数据"""
     try:
-        # 从Binance获取真实K线
         interval = "1d" if days <= 30 else "3d"
         limit = min(days, 100)
         
         url = f"https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval={interval}&limit={limit}"
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=10, verify=True)
         
         if response.status_code == 200:
             klines = response.json()
             dates = [datetime.fromtimestamp(k[0] / 1000) for k in klines]
-            prices = [float(k[4]) for k in klines]  # 收盘价
+            prices = [float(k[4]) for k in klines]
             return dates, prices
-    except Exception as e:
-        print(f"获取历史数据失败: {e}")
+    except Exception:
+        pass
     
-    # 失败时返回模拟数据
+    # 返回模拟数据
     end = datetime.now()
     start = end - timedelta(days=days)
     dates = [start + timedelta(days=i) for i in range(days)]
@@ -443,11 +444,11 @@ def get_historical_prices(days: int = 30) -> Tuple[list, list]:
     return dates, prices
 
 
-def get_real_klines(interval: str = "1h", limit: int = 100) -> List[Dict]:
+def get_real_klines(interval="1h", limit=100):
     """获取真实K线数据（包含OHLCV）"""
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval={interval}&limit={limit}"
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=10, verify=True)
         
         if response.status_code == 200:
             klines = response.json()
@@ -459,21 +460,7 @@ def get_real_klines(interval: str = "1h", limit: int = 100) -> List[Dict]:
                 'close': float(k[4]),
                 'volume': float(k[5])
             } for k in klines]
-    except Exception as e:
-        print(f"获取K线失败: {e}")
+    except Exception:
+        pass
     
     return []
-
-
-def get_market_summary() -> Dict:
-    """获取市场数据摘要"""
-    market_data.refresh()
-    return {
-        'price': market_data.current_price,
-        'support': market_data.support,
-        'resistance': market_data.resistance,
-        'trend': market_data.trend,
-        'rsi': market_data.rsi,
-        'volume_ratio': market_data.volume_ratio,
-        'volatility': market_data.volatility
-    }
