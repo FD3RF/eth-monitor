@@ -1,19 +1,24 @@
 # indicators.py
 """
-指标计算模块 - 基于统一市场数据计算各项技术指标
-确保指标之间逻辑一致，避免随机数据导致的矛盾
+指标计算模块 - 获取真实市场数据并计算技术指标
+数据来源：Binance 公共API（免费，无需认证）
 """
 import numpy as np
+import requests
 from datetime import datetime, timedelta
-from typing import Dict, Tuple, Optional
-import hashlib
+from typing import Dict, Tuple, Optional, List
+import time
 
 class MarketData:
-    """统一市场数据管理器，确保所有指标使用相同的数据源"""
+    """真实市场数据管理器"""
     
     _instance = None
     _last_update = 0
-    _cache_duration = 5  # 缓存5秒
+    _cache_duration = 10  # 缓存10秒
+    _api_timeout = 10
+    
+    # Binance API (免费公开接口)
+    BINANCE_API = "https://api.binance.com/api/v3"
     
     def __new__(cls):
         if cls._instance is None:
@@ -23,46 +28,173 @@ class MarketData:
     
     def _initialize(self):
         """初始化市场数据"""
-        np.random.seed(int(datetime.now().timestamp()) % 10000)
         self._base_price = 3500.0
         self._volatility = 0.02
-        self._trend = 0  # -1: 下跌, 0: 震荡, 1: 上涨
-        self._generate_new_data()
+        self._trend = 0
+        self._volume_ratio = 1.0
+        self._rsi = 50.0
+        self._macd_signal = 0.0
+        self._money_flow = 0.0
+        self._support = 3400.0
+        self._resistance = 3600.0
+        self._klines = []
+        self._last_api_call = 0
+        self._api_call_interval = 1  # API调用间隔(秒)
+        
+        # 首次获取真实数据
+        self._fetch_real_data()
     
-    def _generate_new_data(self):
-        """生成新的市场数据快照"""
-        # 趋势变化（10%概率改变趋势）
-        if np.random.random() < 0.1:
-            self._trend = np.random.choice([-1, 0, 1])
+    def _fetch_real_data(self):
+        """从Binance获取真实市场数据"""
+        try:
+            # 检查API调用频率限制
+            now = time.time()
+            if now - self._last_api_call < self._api_call_interval:
+                return
+            self._last_api_call = now
+            
+            # 1. 获取当前价格
+            ticker_url = f"{self.BINANCE_API}/ticker/24hr?symbol=ETHUSDT"
+            response = requests.get(ticker_url, timeout=self._api_timeout)
+            
+            if response.status_code == 200:
+                data = response.json()
+                self._base_price = float(data.get('lastPrice', 3500))
+                self._volume_ratio = float(data.get('volume', 1)) / 100000  # 归一化成交量
+                price_change_pct = float(data.get('priceChangePercent', 0))
+                high_price = float(data.get('highPrice', self._base_price * 1.02))
+                low_price = float(data.get('lowPrice', self._base_price * 0.98))
+                
+                # 计算波动率
+                self._volatility = (high_price - low_price) / self._base_price if self._base_price > 0 else 0.02
+                
+                # 计算趋势
+                if price_change_pct > 1:
+                    self._trend = 1
+                elif price_change_pct < -1:
+                    self._trend = -1
+                else:
+                    self._trend = 0
+                
+                # 计算支撑压力位
+                self._support = low_price
+                self._resistance = high_price
+            
+            # 2. 获取K线数据计算技术指标
+            klines_url = f"{self.BINANCE_API}/klines?symbol=ETHUSDT&interval=1h&limit=100"
+            response = requests.get(klines_url, timeout=self._api_timeout)
+            
+            if response.status_code == 200:
+                self._klines = response.json()
+                self._calculate_indicators()
+            
+            self._last_update = time.time()
+            
+        except Exception as e:
+            print(f"获取真实数据失败，使用缓存数据: {e}")
+    
+    def _calculate_indicators(self):
+        """基于真实K线计算技术指标"""
+        if not self._klines or len(self._klines) < 20:
+            return
         
-        # 价格变动
-        trend_factor = self._trend * np.random.uniform(0.001, 0.005)
-        noise = np.random.normal(0, self._volatility * 0.5)
-        price_change = (trend_factor + noise) * self._base_price
-        self._base_price = max(3000, min(4000, self._base_price + price_change))
+        try:
+            # 提取收盘价
+            closes = [float(k[4]) for k in self._klines]
+            volumes = [float(k[5]) for k in self._klines]
+            
+            # 计算RSI (14周期)
+            self._rsi = self._calculate_rsi(closes, 14)
+            
+            # 计算MACD信号
+            self._macd_signal = self._calculate_macd_signal(closes)
+            
+            # 计算资金流向
+            self._money_flow = self._calculate_money_flow(closes, volumes)
+            
+        except Exception as e:
+            print(f"计算指标失败: {e}")
+    
+    def _calculate_rsi(self, prices: List[float], period: int = 14) -> float:
+        """计算RSI"""
+        if len(prices) < period + 1:
+            return 50.0
         
-        # 生成相关市场参数
-        self._volume_ratio = np.random.uniform(0.5, 2.0)  # 成交量比
-        self._volatility_current = np.random.uniform(0.01, 0.05)
-        self._money_flow = np.random.uniform(-1, 1)  # 资金流向
+        deltas = np.diff(prices[-(period + 1):])
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
         
-        # 计算技术指标基础值
-        self._rsi = 50 + self._trend * np.random.uniform(10, 25) + np.random.uniform(-10, 10)
-        self._rsi = max(10, min(90, self._rsi))
+        avg_gain = np.mean(gains) if len(gains) > 0 else 0
+        avg_loss = np.mean(losses) if len(losses) > 0 else 0
         
-        self._macd_signal = self._trend * np.random.uniform(0.5, 1.5)
+        if avg_loss == 0:
+            return 100.0
         
-        # 支撑位和压力位
-        self._support = self._base_price * (1 - np.random.uniform(0.02, 0.05))
-        self._resistance = self._base_price * (1 + np.random.uniform(0.02, 0.05))
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
         
-        self._last_update = datetime.now().timestamp()
+        return round(rsi, 2)
+    
+    def _calculate_macd_signal(self, prices: List[float]) -> float:
+        """计算MACD信号"""
+        if len(prices) < 26:
+            return 0.0
+        
+        # EMA计算
+        ema12 = self._calculate_ema(prices, 12)
+        ema26 = self._calculate_ema(prices, 26)
+        
+        macd = ema12 - ema26
+        
+        # 归一化到 -1 到 1
+        signal = macd / prices[-1] * 100 if prices[-1] > 0 else 0
+        return round(signal, 4)
+    
+    def _calculate_ema(self, prices: List[float], period: int) -> float:
+        """计算EMA"""
+        if len(prices) < period:
+            return prices[-1] if prices else 0
+        
+        multiplier = 2 / (period + 1)
+        ema = np.mean(prices[:period])
+        
+        for price in prices[period:]:
+            ema = (price - ema) * multiplier + ema
+        
+        return ema
+    
+    def _calculate_money_flow(self, prices: List[float], volumes: List[float]) -> float:
+        """计算资金流向 (MFI概念)"""
+        if len(prices) < 2 or len(volumes) < 2:
+            return 0.0
+        
+        # 简化版资金流向：价格上涨时成交量正相关
+        price_changes = np.diff(prices[-20:]) if len(prices) >= 20 else np.diff(prices)
+        volume_changes = volumes[-len(price_changes):]
+        
+        positive_flow = 0
+        negative_flow = 0
+        
+        for i, change in enumerate(price_changes):
+            if i < len(volume_changes):
+                if change > 0:
+                    positive_flow += volume_changes[i]
+                elif change < 0:
+                    negative_flow += volume_changes[i]
+        
+        total_flow = positive_flow + negative_flow
+        if total_flow == 0:
+            return 0.0
+        
+        # 归一化到 -1 到 1
+        mfi = (positive_flow - negative_flow) / total_flow
+        return round(mfi, 4)
     
     def refresh(self, force: bool = False):
-        """刷新数据（带缓存）"""
-        now = datetime.now().timestamp()
+        """刷新数据"""
+        now = time.time()
         if force or (now - self._last_update) > self._cache_duration:
-            self._generate_new_data()
+            self._fetch_real_data()
     
     @property
     def current_price(self) -> float:
@@ -82,11 +214,11 @@ class MarketData:
     
     @property
     def volume_ratio(self) -> float:
-        return self._volume_ratio
+        return round(self._volume_ratio, 2)
     
     @property
     def volatility(self) -> float:
-        return self._volatility_current
+        return round(self._volatility, 4)
     
     @property
     def money_flow_raw(self) -> float:
@@ -99,19 +231,24 @@ class MarketData:
     @property
     def macd_signal(self) -> float:
         return self._macd_signal
+    
+    @property
+    def klines(self) -> List:
+        return self._klines
+
 
 # 全局市场数据实例
 market_data = MarketData()
 
 
 def get_current_price() -> float:
-    """获取当前ETH价格"""
+    """获取当前ETH真实价格"""
     market_data.refresh()
     return market_data.current_price
 
 
 def get_support_resistance() -> Tuple[float, float]:
-    """获取支撑位和压力位"""
+    """获取真实支撑位和压力位"""
     market_data.refresh()
     return market_data.support, market_data.resistance
 
@@ -119,8 +256,7 @@ def get_support_resistance() -> Tuple[float, float]:
 def calculate_volume_price() -> float:
     """
     量价口诀评分 (-100 到 100)
-    基于成交量、价格趋势综合判断
-    正数表示做多信号，负数表示做空信号
+    基于真实成交量和价格趋势
     """
     market_data.refresh()
     
@@ -131,18 +267,17 @@ def calculate_volume_price() -> float:
     score += trend_score
     
     # 2. 成交量确认 (30%)
-    # 放量上涨 = 强多, 放量下跌 = 强空
     volume_factor = (market_data.volume_ratio - 1) * 30
     if market_data.trend > 0:
-        score += volume_factor  # 放量上涨增强多头
+        score += volume_factor
     elif market_data.trend < 0:
-        score -= volume_factor  # 放量下跌增强空头
+        score -= volume_factor
     
     # 3. RSI 辅助 (30%)
     if market_data.rsi > 70:
-        score -= 15  # 超买，减弱多头信号
+        score -= 15
     elif market_data.rsi < 30:
-        score += 15  # 超卖，减弱空头信号
+        score += 15
     else:
         score += (market_data.rsi - 50) * 0.6
     
@@ -152,7 +287,7 @@ def calculate_volume_price() -> float:
 def calculate_multi_resonance() -> float:
     """
     多空共振评分 (-100 到 100)
-    检测多个技术指标是否同向共振
+    基于真实技术指标
     """
     market_data.refresh()
     
@@ -165,30 +300,28 @@ def calculate_multi_resonance() -> float:
     # MACD 信号
     signals.append(market_data.macd_signal * 20)
     
-    # RSI 信号 (反转逻辑)
+    # RSI 信号
     if market_data.rsi > 70:
-        signals.append(-15)  # 超买，空头信号
+        signals.append(-15)
     elif market_data.rsi < 30:
-        signals.append(15)   # 超卖，多头信号
+        signals.append(15)
     else:
         signals.append((market_data.rsi - 50) * 0.4)
     
     # 成交量确认
     if market_data.volume_ratio > 1.5:
-        # 高成交量确认趋势
         signals.append(market_data.trend * 15)
     else:
-        # 低成交量，信号减弱
         signals.append(market_data.trend * 5)
     
-    # 计算共振强度 - 同向信号加权
+    # 计算共振强度
     positive_signals = sum(1 for s in signals if s > 5)
     negative_signals = sum(1 for s in signals if s < -5)
     
     if positive_signals >= 3:
-        score = sum(signals) * 1.2  # 多头共振增强
+        score = sum(signals) * 1.2
     elif negative_signals >= 3:
-        score = sum(signals) * 1.2  # 空头共振增强
+        score = sum(signals) * 1.2
     else:
         score = sum(signals)
     
@@ -198,7 +331,7 @@ def calculate_multi_resonance() -> float:
 def calculate_market_structure() -> float:
     """
     市场结构评分 (-100 到 100)
-    分析高低点结构、趋势线
+    基于真实支撑压力位
     """
     market_data.refresh()
     
@@ -207,29 +340,26 @@ def calculate_market_structure() -> float:
     support = market_data.support
     resistance = market_data.resistance
     
-    # 1. 价格相对于支撑压力的位置 (40%)
+    # 位置分析
     range_size = resistance - support
     price_position = (price - support) / range_size if range_size > 0 else 0.5
     
     if price_position > 0.7:
-        # 接近压力位
         score -= 20
         if market_data.trend > 0:
-            score += 10  # 突破尝试
+            score += 10
     elif price_position < 0.3:
-        # 接近支撑位
         score += 20
         if market_data.trend < 0:
-            score -= 10  # 破位尝试
+            score -= 10
     else:
         score += (price_position - 0.5) * 20
     
-    # 2. 趋势结构 (40%)
+    # 趋势结构
     score += market_data.trend * 30
     
-    # 3. 波动率考量 (20%)
+    # 波动率考量
     if market_data.volatility > 0.03:
-        # 高波动，结构可能被破坏
         score *= 0.7
     
     return round(max(-100, min(100, score)), 2)
@@ -238,29 +368,21 @@ def calculate_market_structure() -> float:
 def calculate_lstm_prediction() -> float:
     """
     LSTM预测评分 (-100 到 100)
-    模拟机器学习模型的趋势预测
+    基于真实趋势和RSI
     """
     market_data.refresh()
     
     score = 0.0
     
-    # 基于当前市场状态的综合预测
-    # LSTM 通常会学习到趋势惯性
-    trend_weight = 0.6
-    
     # 趋势预测
     if market_data.trend != 0:
-        score = market_data.trend * 60 * trend_weight
+        score = market_data.trend * 60 * 0.6
     
     # RSI 反转预测
     if market_data.rsi > 75:
-        score -= 20 * (1 - trend_weight)  # 预测反转
+        score -= 20 * 0.4
     elif market_data.rsi < 25:
-        score += 20 * (1 - trend_weight)
-    
-    # 添加一些预测不确定性
-    noise = np.random.normal(0, 10)
-    score += noise
+        score += 20 * 0.4
     
     return round(max(-100, min(100, score)), 2)
 
@@ -268,25 +390,20 @@ def calculate_lstm_prediction() -> float:
 def calculate_money_flow() -> float:
     """
     资金流向评分 (-100 到 100)
-    分析主力资金进出
+    基于真实资金流向指标
     """
     market_data.refresh()
     
     score = 0.0
-    
-    # 基础资金流向
     base_flow = market_data.money_flow_raw * 50
-    
-    # 成交量加权
     volume_weighted = base_flow * (0.5 + market_data.volume_ratio * 0.5)
     
-    # 趋势确认
     if market_data.trend > 0 and base_flow > 0:
-        score = volume_weighted * 1.3  # 资金流入 + 上涨趋势 = 强多
+        score = volume_weighted * 1.3
     elif market_data.trend < 0 and base_flow < 0:
-        score = volume_weighted * 1.3  # 资金流出 + 下跌趋势 = 强空
+        score = volume_weighted * 1.3
     elif market_data.trend * base_flow < 0:
-        score = volume_weighted * 0.5  # 背离，信号减弱
+        score = volume_weighted * 0.5
     else:
         score = volume_weighted
     
@@ -294,24 +411,52 @@ def calculate_money_flow() -> float:
 
 
 def get_historical_prices(days: int = 30) -> Tuple[list, list]:
-    """生成连续的历史价格数据用于图表"""
+    """获取真实历史K线数据"""
+    try:
+        # 从Binance获取真实K线
+        interval = "1d" if days <= 30 else "3d"
+        limit = min(days, 100)
+        
+        url = f"https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval={interval}&limit={limit}"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            klines = response.json()
+            dates = [datetime.fromtimestamp(k[0] / 1000) for k in klines]
+            prices = [float(k[4]) for k in klines]  # 收盘价
+            return dates, prices
+    except Exception as e:
+        print(f"获取历史数据失败: {e}")
+    
+    # 失败时返回模拟数据
     end = datetime.now()
     start = end - timedelta(days=days)
     dates = [start + timedelta(days=i) for i in range(days)]
-    
-    # 生成连续的价格数据
-    base = 3400
-    prices = []
-    current_price = base
-    
-    for i in range(days):
-        # 模拟价格走势
-        trend = np.sin(i / 10) * 50  # 周期性波动
-        noise = np.random.normal(0, 30)
-        current_price = base + trend + noise + i * 2
-        prices.append(round(current_price, 2))
+    prices = [3500 + i * 5 + np.random.uniform(-50, 50) for i in range(days)]
     
     return dates, prices
+
+
+def get_real_klines(interval: str = "1h", limit: int = 100) -> List[Dict]:
+    """获取真实K线数据（包含OHLCV）"""
+    try:
+        url = f"https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval={interval}&limit={limit}"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            klines = response.json()
+            return [{
+                'time': datetime.fromtimestamp(k[0] / 1000),
+                'open': float(k[1]),
+                'high': float(k[2]),
+                'low': float(k[3]),
+                'close': float(k[4]),
+                'volume': float(k[5])
+            } for k in klines]
+    except Exception as e:
+        print(f"获取K线失败: {e}")
+    
+    return []
 
 
 def get_market_summary() -> Dict:

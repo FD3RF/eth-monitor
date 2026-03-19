@@ -118,61 +118,109 @@ st.session_state.last_plan = plan
 col_chart, col_signal = st.columns([3, 2])
 
 with col_chart:
-    st.subheader("📈 ETH/USDT 永续合约")
+    st.subheader("📈 ETH/USDT 永续合约 (真实数据)")
     
-    # 获取历史数据
-    dates, prices = get_historical_prices(60)
+    # 获取真实K线数据
+    from indicators import get_real_klines
+    real_klines = get_real_klines("1h", 100)
     
-    # 创建K线图
-    fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.03,
-        row_heights=[0.7, 0.3]
-    )
-    
-    # K线
-    fig.add_trace(
-        go.Candlestick(
-            x=dates,
-            open=[p * (1 + np.random.uniform(-0.01, 0.01)) for p in prices],
-            high=[p * 1.02 for p in prices],
-            low=[p * 0.98 for p in prices],
-            close=prices,
-            name="ETH"
-        ),
-        row=1, col=1
-    )
+    if real_klines:
+        # 使用真实K线数据
+        kline_dates = [k['time'] for k in real_klines]
+        opens = [k['open'] for k in real_klines]
+        highs = [k['high'] for k in real_klines]
+        lows = [k['low'] for k in real_klines]
+        closes = [k['close'] for k in real_klines]
+        volumes = [k['volume'] for k in real_klines]
+        
+        # 创建K线图
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.03,
+            row_heights=[0.7, 0.3]
+        )
+        
+        # 真实K线
+        fig.add_trace(
+            go.Candlestick(
+                x=kline_dates,
+                open=opens,
+                high=highs,
+                low=lows,
+                close=closes,
+                name="ETH",
+                increasing_line_color='#26a69a',
+                decreasing_line_color='#ef5350'
+            ),
+            row=1, col=1
+        )
+        
+        # 真实成交量
+        colors = ['#26a69a' if closes[i] >= opens[i] else '#ef5350' for i in range(len(closes))]
+        fig.add_trace(
+            go.Bar(x=kline_dates, y=volumes, name="成交量", marker_color=colors, opacity=0.7),
+            row=2, col=1
+        )
+        
+        data_source = "🟢 Binance 实时数据"
+    else:
+        # 回退到历史价格数据
+        dates, prices = get_historical_prices(60)
+        
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.03,
+            row_heights=[0.7, 0.3]
+        )
+        
+        fig.add_trace(
+            go.Candlestick(
+                x=dates,
+                open=[p * (1 + np.random.uniform(-0.01, 0.01)) for p in prices],
+                high=[p * 1.02 for p in prices],
+                low=[p * 0.98 for p in prices],
+                close=prices,
+                name="ETH"
+            ),
+            row=1, col=1
+        )
+        
+        volumes = [np.random.uniform(1000, 5000) for _ in prices]
+        fig.add_trace(
+            go.Bar(x=dates, y=volumes, name="成交量", marker_color='lightblue'),
+            row=2, col=1
+        )
+        
+        data_source = "⚠️ 使用模拟数据"
     
     # 添加支撑压力位
     current_support = plan['support']
     current_resistance = plan['resistance']
     
-    fig.add_hline(y=current_support, line_dash="dash", line_color="green", 
+    fig.add_hline(y=current_support, line_dash="dash", line_color="#4CAF50", 
                   annotation_text=f"支撑 ${current_support:,.0f}", row=1, col=1)
-    fig.add_hline(y=current_resistance, line_dash="dash", line_color="red",
+    fig.add_hline(y=current_resistance, line_dash="dash", line_color="#F44336",
                   annotation_text=f"压力 ${current_resistance:,.0f}", row=1, col=1)
     
     # 如果有交易计划，标记入场点
     if plan.get('tradeable'):
-        fig.add_hline(y=plan['entry'], line_dash="dot", line_color="blue",
+        fig.add_hline(y=plan['entry'], line_dash="dot", line_color="#2196F3",
                       annotation_text=f"入场 ${plan['entry']:,.0f}", row=1, col=1)
-    
-    # 成交量
-    volumes = [np.random.uniform(1000, 5000) for _ in prices]
-    fig.add_trace(
-        go.Bar(x=dates, y=volumes, name="成交量", marker_color='lightblue'),
-        row=2, col=1
-    )
     
     fig.update_layout(
         height=500,
         showlegend=False,
         xaxis_rangeslider_visible=False,
-        margin=dict(l=0, r=0, t=0, b=0)
+        margin=dict(l=0, r=0, t=0, b=0),
+        plot_bgcolor='#1a1a2e',
+        paper_bgcolor='#1a1a2e',
+        font=dict(color='white')
     )
     
     st.plotly_chart(fig, use_container_width=True)
+    st.caption(data_source)
 
 with col_signal:
     # 实时指标卡片
