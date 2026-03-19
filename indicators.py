@@ -18,7 +18,13 @@ class MarketData:
     _api_timeout = 10
     
     # Binance API (免费公开接口)
-    BINANCE_API = "https://api.binance.com/api/v3"
+    # 备用API: Binance (主要) + CoinGecko (次要)
+COINGECKO_API = "https://api.coingecko.com/api/v3"
+
+BINANCE_PRICE_API = "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"
+BINANCE_KLINES_API = "https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=1h&limit=100"
+COINGECKO_API = "https://api.coingecko.com/api/v3/coins/ethereum/market_chart?vs_currency=usd&days=30"
+COINGECKO_OHlc_api = "https://api.coingecko.com/api/v3/coins/ethereum/ohlc?vs_currency=usd&days=30"
     
     def __new__(cls):
         if cls._instance is None:
