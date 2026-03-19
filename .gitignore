@@ -9,8 +9,8 @@ ENV/
 env/
 .venv/
 
-# Streamlit
-.streamlit/
+# Streamlit (keep config for deployment)
+# .streamlit/
 
 # IDE
 .idea/
