@@ -1,413 +1,326 @@
-# streamlit_app.py
 """
-ETH Monitor - 机构级 AI 量化交易系统
-主应用入口
+以太坊 5 分钟合约高频交易策略 - Streamlit 应用
+
+功能：
+- 每 60 秒自动获取最新 200 根 5 分钟 K 线
+- 计算 EMA12、EMA26、RSI14
+- 根据金叉/死叉 + RSI 条件生成做多/做空信号
+- 模拟持仓管理（含止盈止损、EMA26 反向平仓）
+- 交互式 K 线图（标记信号点，显示均线）
+- 实时显示持仓状态、最新价格、信号历史
+
+运行方式：
+    pip install -r requirements.txt
+    streamlit run app.py
 """
-import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
+
 import time
-import numpy as np
+import ccxt
+import pandas as pd
+import pandas_ta as ta
+import plotly.graph_objects as go
+import streamlit as st
+from datetime import datetime
 
-from config import DEFAULT_TRADE_SIZE, DEFAULT_TRADE_THRESHOLD, SIGNAL_THRESHOLD_STRONG
-from trading_engine import engine
-from ai_audit import auditor
-from indicators import get_historical_prices, get_current_price, get_support_resistance, market_data
-from okx_client import OKXClient, MockOKXClient
+# ==================== 配置参数 ====================
+SYMBOL = 'ETH/USDT'
+TIMEFRAME = '5m'
+LIMIT = 200
+REFRESH_INTERVAL = 60  # 秒
+STOP_LOSS_PCT = 0.015  # 1.5%
+TAKE_PROFIT_PCT = 0.02  # 2%
 
-# 页面配置
-st.set_page_config(
-    page_title="ETH Monitor - 机构级AI量化系统",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# ==================== 数据获取 ====================
+@st.cache_data(ttl=REFRESH_INTERVAL)
+def fetch_ohlcv():
+    """
+    从 Binance 获取最新 K 线数据
+    使用缓存避免频繁请求，ttl 与刷新间隔一致
+    """
+    exchange = ccxt.binance({
+        'enableRateLimit': True,
+        'options': {'defaultType': 'future'}  # 使用永续合约数据
+    })
+    try:
+        ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=LIMIT)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        return df
+    except Exception as e:
+        st.error(f"数据获取失败: {e}")
+        # 返回空 DataFrame
+        return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
 
-# ==================== 初始化 Session State ====================
-def init_session_state():
-    """初始化会话状态"""
-    if 'account_balance' not in st.session_state:
-        st.session_state.account_balance = 10000.0
-    if 'auto_trade' not in st.session_state:
-        st.session_state.auto_trade = False
-    if 'last_trade_time' not in st.session_state:
-        st.session_state.last_trade_time = None
-    if 'client' not in st.session_state:
-        st.session_state.client = None
-    if 'trade_history' not in st.session_state:
-        st.session_state.trade_history = []
-    if 'last_plan' not in st.session_state:
-        st.session_state.last_plan = None
 
-init_session_state()
+# ==================== 指标计算 ====================
+def add_indicators(df):
+    """添加 EMA12, EMA26, RSI14"""
+    df = df.copy()
+    df['EMA12'] = ta.ema(df['close'], length=12)
+    df['EMA26'] = ta.ema(df['close'], length=26)
+    df['RSI'] = ta.rsi(df['close'], length=14)
+    return df
 
-# ==================== 侧边栏配置 ====================
-with st.sidebar:
-    st.header("⚙️ 系统配置")
-    
-    # OKX API 配置
-    st.subheader("🔐 OKX API")
-    col_api1, col_api2 = st.columns(2)
-    with col_api1:
-        api_key = st.text_input("API Key", type="password", key="api_key_input")
-        api_secret = st.text_input("API Secret", type="password", key="api_secret_input")
-    with col_api2:
-        passphrase = st.text_input("Passphrase", type="password", key="passphrase_input")
-        simulate_mode = st.checkbox("模拟盘", value=True)
-    
-    # 连接按钮
-    if st.button("连接 OKX", use_container_width=True):
-        if api_key and api_secret and passphrase:
-            client = OKXClient(api_key, api_secret, passphrase, simulate=simulate_mode)
-            if client.test_connection():
-                st.session_state.client = client
-                acc = client.get_account()
-                if acc.get('code') == '0' and acc.get('data'):
-                    st.session_state.account_balance = float(acc['data'][0].get('totalEq', 10000))
-                st.success(f"✅ 连接成功！余额: {st.session_state.account_balance:,.2f} USDT")
-            else:
-                st.error("❌ 连接失败，请检查API配置")
-        else:
-            st.session_state.client = MockOKXClient()
-            st.info("📌 使用模拟模式")
-    
-    st.divider()
-    
-    # 自动交易设置
-    st.subheader("🤖 自动交易")
-    auto_trade = st.toggle("启用自动交易", value=st.session_state.auto_trade)
-    if auto_trade != st.session_state.auto_trade:
-        st.session_state.auto_trade = auto_trade
-    
-    if st.session_state.auto_trade:
-        st.warning("⚠️ 自动交易已启用，系统将根据信号自动执行")
-    
-    trade_size = st.number_input("下单数量（张）", min_value=0.1, value=DEFAULT_TRADE_SIZE, step=0.1)
-    trade_threshold = st.slider("交易阈值（信号强度%）", 0, 100, DEFAULT_TRADE_THRESHOLD, 5)
-    
-    st.divider()
-    
-    # 刷新设置
-    st.subheader("🔄 刷新设置")
-    auto_refresh = st.checkbox("自动刷新", value=True)
-    refresh_rate = st.slider("刷新间隔（秒）", 5, 60, 10, 5) if auto_refresh else 60
-    
-    # 手动刷新按钮
-    if st.button("🔄 立即刷新", use_container_width=True):
-        market_data.refresh(force=True)
-        st.rerun()
-    
-    st.divider()
-    
-    # 显示账户信息
-    st.subheader("💰 账户信息")
-    st.metric("账户余额", f"${st.session_state.account_balance:,.2f}")
-    st.metric("连接状态", "已连接" if st.session_state.client else "未连接")
 
-# ==================== 主界面 ====================
-st.title("📊 ETH Monitor - 机构级 AI 量化交易系统")
-st.caption(f"最后更新: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 刷新间隔: {refresh_rate}秒")
+# ==================== 策略逻辑 ====================
+def detect_signals(df):
+    """
+    基于金叉/死叉和 RSI 生成信号
+    返回信号列：'signal' = 1 为做多，-1 为做空，0 为无信号
+    """
+    df = df.copy()
+    df['ema12_above'] = df['EMA12'] > df['EMA26']
+    df['golden_cross'] = (df['ema12_above'] == True) & (df['ema12_above'].shift(1) == False)
+    df['death_cross'] = (df['ema12_above'] == False) & (df['ema12_above'].shift(1) == True)
 
-# ==================== 获取交易计划 ====================
-plan = engine.generate_trading_plan(st.session_state.account_balance)
-st.session_state.last_plan = plan
+    df['signal'] = 0
+    df.loc[df['golden_cross'] & (df['RSI'] > 50), 'signal'] = 1
+    df.loc[df['death_cross'] & (df['RSI'] < 50), 'signal'] = -1
+    return df
 
-# ==================== K线图和信号面板 ====================
-col_chart, col_signal = st.columns([3, 2])
 
-with col_chart:
-    st.subheader("📈 ETH/USDT 永续合约 (真实数据)")
-    
-    # 获取真实K线数据
-    from indicators import get_real_klines
-    real_klines = get_real_klines("1h", 100)
-    
-    if real_klines:
-        # 使用真实K线数据
-        kline_dates = [k['time'] for k in real_klines]
-        opens = [k['open'] for k in real_klines]
-        highs = [k['high'] for k in real_klines]
-        lows = [k['low'] for k in real_klines]
-        closes = [k['close'] for k in real_klines]
-        volumes = [k['volume'] for k in real_klines]
-        
-        # 创建K线图
-        fig = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.03,
-            row_heights=[0.7, 0.3]
-        )
-        
-        # 真实K线
-        fig.add_trace(
-            go.Candlestick(
-                x=kline_dates,
-                open=opens,
-                high=highs,
-                low=lows,
-                close=closes,
-                name="ETH",
-                increasing_line_color='#26a69a',
-                decreasing_line_color='#ef5350'
-            ),
-            row=1, col=1
-        )
-        
-        # 真实成交量
-        colors = ['#26a69a' if closes[i] >= opens[i] else '#ef5350' for i in range(len(closes))]
-        fig.add_trace(
-            go.Bar(x=kline_dates, y=volumes, name="成交量", marker_color=colors, opacity=0.7),
-            row=2, col=1
-        )
-        
-        data_source = "🟢 Binance 实时数据"
+def simulate_trading(df, position_state):
+    """
+    根据信号模拟持仓，返回新的持仓状态和新产生的信号记录
+    position_state 包含：
+        - position: 'long', 'short', 'none'
+        - entry_price
+        - stop_loss
+        - take_profit
+        - signals (历史信号列表)
+    """
+    state = position_state.copy()
+    new_signals = []
+
+    # 确保 df 已包含信号列
+    if 'signal' not in df.columns:
+        return state, new_signals
+
+    # 只处理新出现的K线（从上次最后处理的时间戳之后）
+    last_processed_ts = state.get('last_processed_ts', None)
+    if last_processed_ts is None:
+        # 首次运行，处理所有 K 线
+        start_idx = 0
     else:
-        # 回退到历史价格数据
-        dates, prices = get_historical_prices(60)
-        
-        fig = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.03,
-            row_heights=[0.7, 0.3]
-        )
-        
-        fig.add_trace(
-            go.Candlestick(
-                x=dates,
-                open=[p * (1 + np.random.uniform(-0.01, 0.01)) for p in prices],
-                high=[p * 1.02 for p in prices],
-                low=[p * 0.98 for p in prices],
-                close=prices,
-                name="ETH"
-            ),
-            row=1, col=1
-        )
-        
-        volumes = [np.random.uniform(1000, 5000) for _ in prices]
-        fig.add_trace(
-            go.Bar(x=dates, y=volumes, name="成交量", marker_color='lightblue'),
-            row=2, col=1
-        )
-        
-        data_source = "⚠️ 使用模拟数据"
-    
-    # 添加支撑压力位
-    current_support = plan['support']
-    current_resistance = plan['resistance']
-    
-    fig.add_hline(y=current_support, line_dash="dash", line_color="#4CAF50", 
-                  annotation_text=f"支撑 ${current_support:,.0f}", row=1, col=1)
-    fig.add_hline(y=current_resistance, line_dash="dash", line_color="#F44336",
-                  annotation_text=f"压力 ${current_resistance:,.0f}", row=1, col=1)
-    
-    # 如果有交易计划，标记入场点
-    if plan.get('tradeable'):
-        fig.add_hline(y=plan['entry'], line_dash="dot", line_color="#2196F3",
-                      annotation_text=f"入场 ${plan['entry']:,.0f}", row=1, col=1)
-    
+        # 找到最后一个已处理 K 线的位置
+        start_idx = df.index.get_indexer([last_processed_ts], method='pad')[0]
+        if start_idx < 0:
+            start_idx = 0
+        else:
+            start_idx += 1
+
+    if start_idx >= len(df):
+        return state, new_signals
+
+    for i in range(start_idx, len(df)):
+        row = df.iloc[i]
+        current_time = row.name
+        current_price = row['close']
+
+        # 平仓检查（优先于新开仓）
+        close_signal = False
+        close_reason = None
+
+        if state['position'] == 'long':
+            # 止盈止损
+            if current_price <= state['stop_loss'] or current_price >= state['take_profit']:
+                close_signal = True
+                close_reason = '止盈止损'
+            # 反向跌破 EMA26
+            elif current_price < row['EMA26']:
+                close_signal = True
+                close_reason = '跌破 EMA26'
+            # 出现做空信号
+            elif row['signal'] == -1:
+                close_signal = True
+                close_reason = '做空信号'
+
+        elif state['position'] == 'short':
+            if current_price >= state['stop_loss'] or current_price <= state['take_profit']:
+                close_signal = True
+                close_reason = '止盈止损'
+            elif current_price > row['EMA26']:
+                close_signal = True
+                close_reason = '突破 EMA26'
+            elif row['signal'] == 1:
+                close_signal = True
+                close_reason = '做多信号'
+
+        if close_signal:
+            # 记录平仓信号
+            new_signals.append({
+                'time': current_time,
+                'type': f'平{state["position"]}',
+                'price': current_price,
+                'reason': close_reason,
+                'entry_price': state['entry_price']
+            })
+            state['position'] = 'none'
+            state['entry_price'] = None
+            state['stop_loss'] = None
+            state['take_profit'] = None
+
+        # 开仓检查（无持仓时）
+        if state['position'] == 'none':
+            if row['signal'] == 1:   # 做多
+                state['position'] = 'long'
+                state['entry_price'] = current_price
+                state['stop_loss'] = current_price * (1 - STOP_LOSS_PCT)
+                state['take_profit'] = current_price * (1 + TAKE_PROFIT_PCT)
+                new_signals.append({
+                    'time': current_time,
+                    'type': '做多',
+                    'price': current_price,
+                    'reason': '金叉+RSI>50',
+                    'entry_price': current_price
+                })
+            elif row['signal'] == -1:  # 做空
+                state['position'] = 'short'
+                state['entry_price'] = current_price
+                state['stop_loss'] = current_price * (1 + STOP_LOSS_PCT)
+                state['take_profit'] = current_price * (1 - TAKE_PROFIT_PCT)
+                new_signals.append({
+                    'time': current_time,
+                    'type': '做空',
+                    'price': current_price,
+                    'reason': '死叉+RSI<50',
+                    'entry_price': current_price
+                })
+
+    # 更新最后处理的时间戳
+    if len(df) > 0:
+        state['last_processed_ts'] = df.index[-1]
+
+    return state, new_signals
+
+
+# ==================== 绘图 ====================
+def plot_candlestick(df, signals):
+    """
+    绘制 K 线图，并标注信号点，添加均线
+    signals 为信号列表，每个元素包含 time, type, price
+    """
+    fig = go.Figure()
+
+    # 添加 K 线
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df['open'],
+        high=df['high'],
+        low=df['low'],
+        close=df['close'],
+        name='K线'
+    ))
+
+    # 添加 EMA12 和 EMA26
+    fig.add_trace(go.Scatter(x=df.index, y=df['EMA12'], mode='lines', name='EMA12', line=dict(color='orange', width=1)))
+    fig.add_trace(go.Scatter(x=df.index, y=df['EMA26'], mode='lines', name='EMA26', line=dict(color='blue', width=1)))
+
+    # 添加信号标记
+    for sig in signals:
+        marker_color = 'green' if sig['type'] == '做多' else 'red'
+        marker_symbol = 'triangle-up' if sig['type'] == '做多' else 'triangle-down'
+        # 找到对应时间点的价格
+        price = sig['price']
+        fig.add_trace(go.Scatter(
+            x=[sig['time']],
+            y=[price],
+            mode='markers',
+            marker=dict(symbol=marker_symbol, size=12, color=marker_color),
+            name=sig['type'],
+            text=f"{sig['type']} @ {price:.2f}",
+            hoverinfo='text'
+        ))
+
     fig.update_layout(
-        height=500,
-        showlegend=False,
+        title=f'{SYMBOL} 5分钟K线图',
+        xaxis_title='时间',
+        yaxis_title='价格',
+        height=600,
         xaxis_rangeslider_visible=False,
-        margin=dict(l=0, r=0, t=0, b=0),
-        plot_bgcolor='#1a1a2e',
-        paper_bgcolor='#1a1a2e',
-        font=dict(color='white')
+        template='plotly_dark'
     )
-    
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption(data_source)
+    return fig
 
-with col_signal:
-    # 实时指标卡片
-    st.subheader("📊 市场概览")
-    
-    current_price = plan['current_price']
-    support = plan['support']
-    resistance = plan['resistance']
-    
-    col_m1, col_m2, col_m3 = st.columns(3)
-    with col_m1:
-        st.metric("当前价格", f"${current_price:,.2f}")
-    with col_m2:
-        st.metric("支撑位", f"${support:,.2f}")
-    with col_m3:
-        st.metric("压力位", f"${resistance:,.2f}")
-    
-    st.divider()
-    
-    # 信号展示
-    st.subheader("🎯 交易信号")
-    
-    direction = plan['direction']
-    signal_quality = plan.get('signal_quality', '无')
-    
-    if direction == 'long':
-        st.success(f"🟢 **做多信号**")
-    elif direction == 'short':
-        st.error(f"🔴 **做空信号**")
-    else:
-        st.info(f"⚪ **观望**")
-    
-    # 评分展示
-    col_s1, col_s2, col_s3 = st.columns(3)
-    with col_s1:
-        st.metric("综合评分", f"{plan['composite_score']:.1f}")
-    with col_s2:
-        st.metric("信号强度", f"{plan['signal_strength']*100:.0f}%")
-    with col_s3:
-        st.metric("信号质量", signal_quality)
-    
-    # 冲突警告
-    if plan.get('has_conflict'):
-        st.warning(f"⚠️ {plan.get('conflict_desc', '检测到信号冲突')}")
-    
-    st.divider()
-    
-    # 不可交易原因
-    if not plan.get('tradeable'):
-        st.info(f"📋 {plan.get('reason', '无交易计划')}")
 
-# ==================== 指标贡献分析 ====================
-st.divider()
-st.subheader("🔍 指标贡献分析")
+# ==================== 主程序 ====================
+def main():
+    st.set_page_config(page_title="ETH/USDT 5min 高频策略", layout="wide")
+    st.title("ETH/USDT 5分钟合约高频策略监控")
 
-scores = plan['scores']
+    # 初始化 session state
+    if 'position_state' not in st.session_state:
+        st.session_state.position_state = {
+            'position': 'none',
+            'entry_price': None,
+            'stop_loss': None,
+            'take_profit': None,
+            'last_processed_ts': None,
+        }
+    if 'signals_history' not in st.session_state:
+        st.session_state.signals_history = []  # 所有历史信号
 
-# 指标详情展开
-with st.expander("📊 查看各指标详情", expanded=True):
-    col_i1, col_i2, col_i3 = st.columns(3)
-    
-    with col_i1:
-        st.metric("量价口诀", f"{scores['volume_price']:.1f}", 
-                  delta="多头" if scores['volume_price'] > 0 else "空头" if scores['volume_price'] < 0 else "中性")
-        st.metric("多空共振", f"{scores['multi_resonance']:.1f}",
-                  delta="多头" if scores['multi_resonance'] > 0 else "空头" if scores['multi_resonance'] < 0 else "中性")
-    
-    with col_i2:
-        st.metric("市场结构", f"{scores['market_structure']:.1f}",
-                  delta="多头" if scores['market_structure'] > 0 else "空头" if scores['market_structure'] < 0 else "中性")
-        st.metric("LSTM预测", f"{scores['lstm_prediction']:.1f}",
-                  delta="多头" if scores['lstm_prediction'] > 0 else "空头" if scores['lstm_prediction'] < 0 else "中性")
-    
-    with col_i3:
-        st.metric("资金流向", f"{scores['money_flow']:.1f}",
-                  delta="多头" if scores['money_flow'] > 0 else "空头" if scores['money_flow'] < 0 else "中性")
-        st.metric("AI评分", f"{scores['ai_score']:.1f}",
-                  delta="多头" if scores['ai_score'] > 0 else "空头" if scores['ai_score'] < 0 else "中性")
+    placeholder = st.empty()
 
-# 指标一致性分析
-long_count = sum(1 for v in scores.values() if v > 10)
-short_count = sum(1 for v in scores.values() if v < -10)
-neutral_count = len(scores) - long_count - short_count
+    while True:
+        with placeholder.container():
+            st.write("### 实时数据与信号")
+            # 获取数据
+            df_raw = fetch_ohlcv()
+            if df_raw.empty:
+                st.error("无法获取数据，请检查网络后重试。")
+                time.sleep(REFRESH_INTERVAL)
+                continue
 
-st.write(f"**指标一致性**: 🟢 {long_count} 多头 | 🔴 {short_count} 空头 | ⚪ {neutral_count} 中性")
+            # 计算指标
+            df = add_indicators(df_raw)
+            df = detect_signals(df)
 
-# ==================== 交易计划 ====================
-st.divider()
-st.subheader("📋 交易计划")
+            # 模拟交易
+            new_state, new_signals = simulate_trading(df, st.session_state.position_state)
+            st.session_state.position_state = new_state
 
-if plan.get('tradeable'):
-    col_p1, col_p2, col_p3, col_p4 = st.columns(4)
-    
-    with col_p1:
-        st.metric("入场价格", f"${plan['entry']:,.2f}")
-    with col_p2:
-        st.metric("止损价格", f"${plan['stop_loss']:,.2f}")
-    with col_p3:
-        st.metric("止盈价格", f"${plan['take_profit']:,.2f}")
-    with col_p4:
-        st.metric("建议仓位", f"${plan['position_size']:,.2f}")
-    
-    # 风险计算
-    risk = abs(plan['entry'] - plan['stop_loss'])
-    reward = abs(plan['take_profit'] - plan['entry'])
-    rr_ratio = reward / risk if risk > 0 else 0
-    
-    st.write(f"**风险收益比**: 1:{rr_ratio:.1f} | **风险金额**: ${plan['position_size'] * risk / plan['entry']:.2f}")
-    
-    # 自动交易执行
-    if st.session_state.auto_trade:
-        if st.session_state.client is None:
-            st.session_state.client = MockOKXClient()
-        
-        # 检查交易条件
-        signal_pct = plan['signal_strength'] * 100
-        
-        if signal_pct >= trade_threshold and not plan.get('has_conflict'):
-            # 频率控制
-            now = time.time()
-            if st.session_state.last_trade_time is None or (now - st.session_state.last_trade_time) > 60:
-                
-                if st.button("🚀 执行交易", type="primary", use_container_width=True):
-                    side = 'buy' if direction == 'long' else 'sell'
-                    posSide = 'long' if direction == 'long' else 'short'
-                    
-                    res = st.session_state.client.place_order(
-                        instId='ETH-USDT-SWAP',
-                        tdMode='cross',
-                        side=side,
-                        posSide=posSide,
-                        sz=trade_size,
-                        px=plan['entry']
-                    )
-                    
-                    if res.get('code') == '0':
-                        st.session_state.last_trade_time = now
-                        st.session_state.trade_history.append({
-                            'time': datetime.now(),
-                            'direction': direction,
-                            'price': plan['entry'],
-                            'size': trade_size
-                        })
-                        st.rerun()
-            else:
-                wait_time = int(60 - (now - st.session_state.last_trade_time))
-                st.caption(f"⏳ 冷却中，{wait_time}秒后可再次交易")
-        else:
-            st.caption(f"当前信号强度 {signal_pct:.0f}% 未达到阈值 {trade_threshold}%")
-else:
-    st.info(f"📌 {plan.get('reason', '暂无交易计划')}")
+            # 更新信号历史
+            if new_signals:
+                st.session_state.signals_history.extend(new_signals)
 
-# ==================== AI 审计报告 ====================
-st.divider()
-st.subheader("🧠 AI 智能审计")
+            # 显示最新价格和持仓状态
+            last_price = df['close'].iloc[-1]
+            col1, col2 = st.columns(2)
+            col1.metric("最新价格", f"{last_price:.2f} USDT")
+            col2.metric("当前持仓", st.session_state.position_state['position'].upper())
 
-col_ai1, col_ai2 = st.columns([1, 2])
+            # 信号提示区（新信号高亮）
+            if new_signals:
+                last_signal = new_signals[-1]
+                if last_signal['type'] == '做多':
+                    st.success(f"🎯 新信号：{last_signal['type']} @ {last_signal['price']:.2f}  理由：{last_signal['reason']}")
+                else:
+                    st.error(f"🎯 新信号：{last_signal['type']} @ {last_signal['price']:.2f}  理由：{last_signal['reason']}")
 
-with col_ai1:
-    if st.button("生成 AI 审计报告", type="secondary", use_container_width=True):
-        with st.spinner("AI 正在分析..."):
-            market_summary = plan.get('market_summary', {})
-            ai_score, report = auditor.audit(market_summary, plan['scores'])
-            st.session_state.ai_report = report
-            st.session_state.ai_score = ai_score
-            st.rerun()
+            # 历史信号表格（最近20条）
+            if st.session_state.signals_history:
+                history_df = pd.DataFrame(st.session_state.signals_history[-20:])
+                history_df = history_df[['time', 'type', 'price', 'reason']].copy()
+                history_df['time'] = history_df['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                history_df['price'] = history_df['price'].round(2)
+                st.write("#### 最近信号记录")
+                st.dataframe(history_df, use_container_width=True)
 
-with col_ai2:
-    if 'ai_report' in st.session_state:
-        st.markdown(st.session_state.ai_report)
-    else:
-        st.caption("点击左侧按钮生成 AI 分析报告")
+            # K 线图（仅显示最近 200 根，与数据一致）
+            st.write("#### K 线图与信号标记")
+            # 仅展示当前数据范围内的信号
+            signals_to_plot = [s for s in st.session_state.signals_history if s['time'] >= df.index[0]]
+            fig = plot_candlestick(df, signals_to_plot)
+            st.plotly_chart(fig, use_container_width=True)
 
-# ==================== 交易历史 ====================
-if st.session_state.trade_history:
-    st.divider()
-    st.subheader("📜 交易历史")
-    
-    history_df = pd.DataFrame(st.session_state.trade_history[-10:])
-    if not history_df.empty:
-        history_df['time'] = pd.to_datetime(history_df['time']).dt.strftime('%H:%M:%S')
-        st.dataframe(history_df, use_container_width=True, hide_index=True)
+            # 底部状态栏
+            st.caption(f"数据更新时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 每 {REFRESH_INTERVAL} 秒自动刷新")
 
-# ==================== 页脚信息 ====================
-st.divider()
-st.caption(f"""
-**ETH Monitor v2.0** | 机构级 AI 量化交易系统
-- 多维度指标分析 | AI 智能审计 | 自动风险管理
-- 刷新间隔: {refresh_rate}秒 | 自动刷新: {'✅' if auto_refresh else '❌'}
-""")
+        # 等待下一次刷新
+        time.sleep(REFRESH_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
